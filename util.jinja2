@@ -1,0 +1,12 @@
+{%- macro util.create_trigger_references(table, prefix, suffix='') %}
+{%- for event in ('insert','update','delete') %}
+CREATE TRIGGER "{{prefix}}{{table}}_{{event}}" INSTEAD OF {{event}}
+    ON "{{prefix}}{{table}}"
+{%- endfor %} {# /event #}
+    -- [ FROM referenced_table_name ]
+    -- [ NOT DEFERRABLE | [ DEFERRABLE ] { INITIALLY IMMEDIATE | INITIALLY DEFERRED } ]
+    -- [ FOR [ EACH ] { ROW | STATEMENT } ]
+    -- [ WHEN ( condition ) ]
+EXECUTE PROCEDURE "trigger_update_{{prefix}}{{table}}{{suffix}}"();
+
+{%- endmacro %}

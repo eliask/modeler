@@ -1,0 +1,345 @@
+{% import 'util.jinja2' as util %}
+-- TABLE
+
+{%- macro temporal_query(transaction_time, valid_time, localized, language_expr=None) %}
+SELECT
+  "{{table}}__valid".metadata
+  ,"{{table}}__valid".valid_time -- TODO
+{%- if localized %}
+  ,language_iso639.code as _language
+{%- endif %}
+{%- for pkcol in table_.pk %}
+  ,"{{table}}"."{{pkcol.name}}" as "{{pkcol.name}}"
+{%- endfor %}
+{%- for col in table_.attributes %}
+  ,"{{table}}_{{col.name}}"."{{col.name}}" as "{{col.name}}"
+{%- endfor %}
+FROM "{{table}}"
+JOIN "{{table}}__valid"
+  ON {{transaction_time}} <@ "{{table}}__valid".transaction_time
+  {#- NB: we convert dates using the client's local timezone here: #}
+  AND {{valid_time(transaction_time, table_)}}  <@ "{{table}}__valid".valid_time
+  {%- for pkcol in table_.pk %}
+  AND "{{table}}"."{{pkcol.name}}" = "{{table}}__valid"."{{pkcol.name}}"
+  {%- endfor %}
+{%- if table_.localized and language_expr %}
+JOIN language_iso639 ON language_iso639.code = {{language_expr}}
+{%- elif localized %}
+JOIN language_iso639 ON true
+{%- endif %}
+{%- for col in table_.attributes %}
+LEFT JOIN "{{table}}_{{col.name}}"
+  ON true
+  {%- if col.localized %}
+  AND "{{table}}_{{col.name}}"._language = language_iso639.code
+  {%- endif %}
+  {%- for pkcol in table_.pk %}
+  AND "{{table}}"."{{pkcol.name}}" = "{{table}}_{{col.name}}"."{{pkcol.name}}"
+  {%- endfor %}
+  {#- NB: we convert dates using the client's local timezone here: #}
+  AND {{transaction_time}} <@ "{{table}}_{{col.name}}".transaction_time
+  AND {{valid_time(transaction_time, col)}}  <@ "{{table}}_{{col.name}}".valid_time
+{%- endfor %}
+{%- endmacro %}
+
+
+{%- macro new_transaction_time() %}
+tstzrange({{get_t_current_time()}}, 'infinity', '[)')
+{%- endmacro %}
+
+
+{%- macro new_valid_time() %}
+{{table_.valid_type}}({{get_v_current_time(None,table_)}}, 'infinity', '[)')
+{%- endmacro %}
+
+
+{%- macro default_valid_time() %}
+  IF NEW.valid_time IS NULL THEN
+    NEW.valid_time := {{new_valid_time()}};
+  END IF;
+{%- endmacro %}
+
+
+{%- macro default_metadata() %}
+-- For now, allow empty metadata:
+IF NEW.metadata IS NULL THEN
+  NEW.metadata := 0;
+END IF;
+{%- endmacro %}
+
+
+{%- macro default_language(localized=False) %}
+{%- if table_.localized and localized %}
+-- Non-localized views need a default language:
+IF NEW._language IS NULL THEN
+  NEW._language := {{DEFAULT_LANGUAGE}};
+END IF;
+{%- endif %}
+{%- endmacro %}
+
+{%- macro insert_expression(col) %}
+  INSERT INTO "{{table}}_{{col.name}}" (
+    metadata
+    ,transaction_time
+    ,valid_time
+    {%- if col.localized %}, _language{%- endif %}
+    {%- for pkcol in table_.pk %}
+    ,"{{pkcol.name}}"
+    {%- endfor %}
+    ,"{{col.name}}"
+  )
+  VALUES (
+    NEW.metadata
+    ,{{new_transaction_time()}}
+    ,{{new_valid_time()}}
+    {%- if col.localized %}, NEW._language{%- endif %}
+    {%- for pkcol in table_.pk %}
+    ,NEW."{{pkcol.name}}"
+    {%- endfor %}
+    ,NEW."{{col.name}}"
+  );
+{%- endmacro %}
+
+
+{%- macro insert_expression_valid_time() %}
+INSERT INTO "{{table}}__valid" (
+  metadata
+  ,transaction_time
+  ,valid_time
+  {%- for pkcol in table_.pk %}
+  ,"{{pkcol.name}}"
+  {%- endfor %}
+) VALUES (
+  NEW.metadata
+  ,{{new_transaction_time()}}
+  ,coalesce(NEW.valid_time, {{new_valid_time()}})
+  {%- for pkcol in table_.pk %}
+  ,NEW."{{pkcol.name}}"
+  {%- endfor %}
+);
+{%- endmacro %}
+
+
+{%- macro create_trigger_functions(prefix, localized, suffix='')%}
+
+{{util.create_delete_trigger_function(table, prefix, table_.inverse_fks, suffix)}}
+
+CREATE OR REPLACE FUNCTION "trigger_update_{{prefix}}{{table}}{{suffix}}"()
+RETURNS TRIGGER AS $$
+DECLARE
+  num_rows int;
+BEGIN
+
+  -- TODO: handle updates to valid_time (?)
+
+  IF false
+  {%- for pkcol in table_.pk %}
+  OR NEW."{{pkcol.name}}" IS DISTINCT FROM OLD."{{pkcol.name}}"
+  {%- endfor %}
+  THEN
+    -- TODO: implement (?)
+    RAISE EXCEPTION 'Unsupported operation: Cannot alter primary key columns';
+  END IF;
+
+  {{default_metadata()}}
+  {{default_valid_time()}}
+  {{default_language(localized)}}
+
+  IF NEW.valid_time IS DISTINCT FROM OLD.valid_time THEN
+    -- First invalidate the old (entity) version:
+    UPDATE "{{table}}__valid" t
+    SET
+      transaction_time = tstzrange(lower(transaction_time), current_timestamp, '[)')
+    WHERE current_timestamp <@ transaction_time
+    AND valid_time = OLD.valid_time
+    {%- for pkcol in table_.pk %}
+    AND "{{pkcol.name}}" = OLD."{{pkcol.name}}"
+    {%- endfor %}
+    ;
+
+    GET DIAGNOSTICS num_rows = ROW_COUNT;
+    IF num_rows <> 1 THEN
+      RAISE EXCEPTION '!= 1 rows updated: %', num_rows;
+    END IF;
+
+    -- Then insert a new validity time period for the entity:
+    {{insert_expression_valid_time()}}
+  END IF;
+
+  {% for col in table_.attributes %}
+  IF NEW."{{col.name}}" IS DISTINCT FROM OLD."{{col.name}}" THEN
+    -- First invalidate the old (attribute) version:
+    UPDATE "{{table}}_{{col.name}}"
+    SET transaction_time = tstzrange(lower(transaction_time), current_timestamp, '[)')
+    WHERE current_timestamp <@ transaction_time
+    AND {{get_v_current_time(None, col)}} <@ valid_time
+    {%- if col.localized %} AND _language IS NOT DISTINCT FROM NEW._language {%- endif %}
+    {%- for pkcol in table_.pk %}
+    AND "{{pkcol.name}}" = OLD."{{pkcol.name}}"
+    {%- endfor %}
+    ;
+
+    GET DIAGNOSTICS num_rows = ROW_COUNT;
+    -- NB: there might not be a previous value.
+    IF num_rows > 1 THEN
+      RAISE EXCEPTION '!= 1 rows updated: % % % %', num_rows::varchar, (
+      select valid_time from "{{table}}_{{col.name}}"
+      WHERE current_timestamp <@ transaction_time
+      AND OLD.valid_time = valid_time
+      {%- if col.localized %} AND _language IS NOT DISTINCT FROM NEW._language {%- endif %}
+      {%- for pkcol in table_.pk %}
+      AND "{{pkcol.name}}" = OLD."{{pkcol.name}}"
+      {%- endfor %}
+      ), OLD.valid_time, NEW.valid_time;
+    END IF;
+
+    -- Then insert a new validity time period for the attribute:
+    IF NEW."{{col.name}}" IS NULL THEN
+      {{non_nullable_verification(col)}}
+    ELSE
+      {{insert_expression(col)}}
+    END IF;
+
+    -- TODO: set implicit default values for NEW (?)
+  END IF;
+  {% endfor %}
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION "insert_{{prefix}}{{table}}{{suffix}}"()
+RETURNS TRIGGER AS $$
+BEGIN
+
+{{default_metadata()}}
+{{default_valid_time()}}
+{{default_language(localized)}}
+
+-- Set default values for *serial PK columns when NULL:
+{%- for pkcol in table_.pk %}
+{%- if 'serial' in pkcol.serial_type %}
+IF NEW."{{pkcol.name}}" IS NULL THEN
+  NEW."{{pkcol.name}}" := NEXTVAL('"{{table}}_{{pkcol.name}}_seq"');
+END IF;
+{%- endif %}
+{%- endfor %}
+
+INSERT INTO "{{table}}" (
+  "{{table_.pk[0].name}}"
+  {%- for pkcol in table_.pk[1:] %}
+  ,"{{pkcol.name}}"
+  {%- endfor %}
+) VALUES (
+  NEW."{{table_.pk[0].name}}"
+  {%- for pkcol in table_.pk[1:] %}
+  ,NEW."{{pkcol.name}}"
+  {%- endfor %}
+);
+
+{{insert_expression_valid_time()}}
+
+{% for col in table_.attributes %}
+IF NEW."{{col.name}}" IS NULL THEN
+  {{non_nullable_verification(col)}}
+ELSE
+  {{insert_expression(col)}}
+END IF;
+{% endfor %}
+
+RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+{%- endmacro %}
+
+
+
+-- Attribute tables:
+{%- for col in table_.attributes %}
+CREATE TABLE IF NOT EXISTS "{{table}}_{{col.name}}" (
+  metadata integer not null
+{%- for pkcol in table_.pk %}
+  ,"{{pkcol.name}}" {{pkcol.type}} not null
+{%- endfor %}
+{%- if col.localized %}
+  ,_language char(2) not null references language_iso639(code)
+{%- endif %}
+  ,"{{col.name}}" {{col.type}} not null {%- if col.fk %} references "{{col.fk.table}}"("{{col.fk.ref_id}}") {%- endif %}
+  ,EXCLUDE USING gist (
+    {%- if col.localized %}
+    _language with =,
+    {%- endif %}
+    {%- for pkcol in table_.pk %}
+    "{{pkcol.name}}" with =,
+    {%- endfor %}
+    transaction_time with &&,
+    valid_time with &&
+  )
+{%- if col.unique %}
+  -- Temporal uniqueness constraint:
+  ,EXCLUDE USING gist (
+    "{{col.name}}" with =,
+    transaction_time with &&,
+    valid_time with &&
+  )
+{%- endif %}
+  ,FOREIGN KEY (
+    "{{table_.pk[0].name}}"
+    {%- for pkcol in table_.pk[1:] %}
+    ,"{{pkcol.name}}"
+    {%- endfor %}
+  ) REFERENCES "{{table}}"(
+    "{{table_.pk[0].name}}"
+    {%- for pkcol in table_.pk[1:] %}
+    ,"{{pkcol.fk.ref_id}}"
+    {%- endfor %}
+  )
+) INHERITS (transaction_valid_{{col.valid_type}});
+{%- endfor %}
+
+
+DROP VIEW IF EXISTS "l_{{table}}"; -- CASCADE;
+DROP VIEW IF EXISTS "loc_l_{{table}}"; -- CASCADE;
+DROP FUNCTION IF EXISTS "p_{{table}}"();
+
+
+CREATE OR REPLACE VIEW "l_{{table}}" AS
+{{temporal_query(
+  get_t_current_time(), get_v_current_time,
+  localized=False, language_expr="'{}'".format(DEFAULT_LANGUAGE), hack=True,
+)}};
+
+CREATE OR REPLACE VIEW "loc_l_{{table}}" AS
+{{temporal_query(get_t_current_time(), get_v_current_time, localized=True, hack=True)}};
+
+CREATE OR REPLACE FUNCTION "p_{{table}}"(
+  valid_at timestamptz
+) RETURNS "l_{{table}}"
+AS $$
+{{temporal_query(
+  'valid_at', get_p_current_time,
+  localized=False, language_expr="'{}'".format(DEFAULT_LANGUAGE),
+)}};
+$$ LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION "loc_p_{{table}}"(
+  language_code char(2),
+  valid_at timestamptz
+) RETURNS "loc_l_{{table}}"
+AS $$
+{{temporal_query(
+  'valid_at', get_p_current_time,
+  localized=True, language_expr='language_code',
+)}};
+$$ LANGUAGE SQL;
+
+-- TODO: pp, pl functions for traversing transaction time
+
+
+-- Table triggers:
+{{create_trigger_functions('l_', localized=False)}}
+{{util.create_trigger_references(table, 'l_')}}
+
+{%- if table_.localized %}
+  {{create_trigger_functions('loc_l_', localized=True)}}
+  {{util.create_trigger_references(table, 'loc_l_')}}
+{%- endif %}

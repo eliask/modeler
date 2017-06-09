@@ -1,0 +1,111 @@
+{% import 'util.jinja2' as util %}
+-- ENUM
+
+CREATE TABLE IF NOT EXISTS "{{table}}" (
+  id {{id_type}} primary key
+);
+
+CREATE TABLE IF NOT EXISTS "{{table}}__valid" (
+  metadata integer not null
+  ,id {{id_type}} primary key
+  ,EXCLUDE USING gist (
+    id with =,
+    transaction_time with &&,
+    valid_time with &&
+  )
+) INHERITS (transaction_valid_{{enum.valid_type}});
+
+{%- if enum.coded %}
+create table if not exists "{{table}}_code" (
+  metadata integer not null
+  ,id {{id_type}} not null references "{{table}}"(id)
+  ,code varchar not null
+  ,EXCLUDE USING gist (
+    code with =
+    ,transaction_time with &&
+    ,valid_time with &&
+  )
+) INHERITS (transaction_valid_{{enum.valid_type}});
+{%- endif %}
+
+{%- if enum.localized %}
+create table if not exists "{{table}}_name" (
+  metadata integer not null
+  ,id {{id_type}} not null references "{{table}}"(id)
+  ,language_code char(2) not null references language_iso639
+  ,name varchar not null
+  ,EXCLUDE USING gist (
+    id with =
+    ,language_code with =
+    ,transaction_time with &&
+    ,valid_time with &&
+  )
+) INHERITS (transaction_valid_{{enum.valid_type}});
+{%- endif %}
+
+
+CREATE OR REPLACE VIEW "l_{{table}}" AS
+SELECT
+  metadata
+  ,"{{table}}__valid".valid_time
+  ,"{{table}}".id as id
+FROM "{{table}}"
+JOIN "{{table}}__valid" USING (id)
+WHERE {{v_current_time}} <@ "{{table}}__valid".valid_time
+  AND {{t_current_time}} <@ "{{table}}__valid".transaction_time
+;
+
+CREATE OR REPLACE FUNCTION "delete_l_{{table}}"()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- TODO
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION "update_l_{{table}}"()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- TODO
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION "insert_l_{{table}}"()
+RETURNS TRIGGER
+AS $$
+DECLARE
+  -- Primary key or id variables. Mainly for auto-filling serials and such (for now).
+  __id "{{table}}".id%TYPE; -- TODO
+BEGIN
+
+-- For now, allow empty metadata:
+IF NEW.metadata IS NULL THEN
+  NEW.metadata := 0;
+END IF;
+
+IF NEW.id IS NULL THEN
+  INSERT INTO "{{table}}" (
+    metadata
+  ) VALUES (
+    NEW.metadata
+  )
+  RETURNING id into __id;
+ELSE
+  INSERT INTO "{{table}}" (
+    metadata, id
+  ) VALUES (
+    NEW.metadata, NEW.id
+  )
+  RETURNING id into __id;
+END IF;
+
+NEW.id := __id;
+
+-- TODO: coded, localized columns.
+
+RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+
+{{util.create_trigger_references(table, 'l_')}}

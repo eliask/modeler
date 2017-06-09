@@ -1,0 +1,31 @@
+-- Maximum size of an email address is 254. See the following RFC erratum:
+-- http://www.rfc-editor.org/errata_search.php?rfc=3696&eid=1690
+--
+-- Also see discussion on:
+-- http://stackoverflow.com/questions/386294/what-is-the-maximum-length-of-a-valid-email-address-
+--
+-- """
+-- I believe erratum ID 1003 is slightly wrong. RFC 2821 places a 256
+-- character limit on the forward-path. But a path is defined as
+--
+-- Path = "<" [ A-d-l ":" ] Mailbox ">"
+--
+-- So the forward-path will contain at least a pair of angle brackets
+-- in addition to the Mailbox. This limits the Mailbox (i.e. the email
+-- address) to 254 characters.
+-- """
+--
+-- So this is probably the maximum length in octets. See RFC 5321:
+-- """
+-- 4.5.3.1.3.  Path
+--
+--   The maximum total length of a reverse-path or forward-path is 256
+--   octets (including the punctuation and element separators).
+-- """
+--
+-- Hence octet_length() would be more appropriate here but then we get
+-- to the business of character encodings and there might be some ugly
+-- corner cases that I don't know of. So let's err on being too
+-- permissive here (there are other levels of validation after all).
+
+create domain email as text check (length(value) <= 254 and value ~ '.+@.+');

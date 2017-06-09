@@ -1,0 +1,26 @@
+-- Surrogate key table
+{#
+We cannot use gist temporal indexes here in place of a usual type of
+ID primary key since foreign keys rely on a unique index being
+present.
+#}
+CREATE TABLE IF NOT EXISTS "{{table}}" (
+  {%- for col in table_.pk %}
+  {{col.name}} {{col.type if col.fk else col.serial_type}} not null {%- if col.fk %} references "{{col.fk.table}}"("{{col.fk.ref_id}}") {%- endif %},
+  {%- endfor %}
+  PRIMARY KEY ("{{table_.pk[0].name}}"{%- for c in table_.pk[1:] %},"{{c.name}}"{% endfor %})
+);
+
+CREATE TABLE IF NOT EXISTS "{{table}}__valid" (
+  metadata integer not null
+  {%- for col in table_.pk %}
+  ,{{col.name}} {{col.type}} not null {%- if col.fk %} references "{{col.fk.table}}"("{{col.fk.ref_id}}") {%- endif %}
+  {%- endfor %}
+  ,EXCLUDE USING gist (
+    {%- for col in table_.pk %}
+    "{{col.name}}" with =,
+    {%- endfor %}
+    transaction_time with &&,
+    valid_time with &&
+  )
+) INHERITS (transaction_valid_{{table_.valid_type}});

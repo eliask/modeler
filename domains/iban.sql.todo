@@ -1,0 +1,14 @@
+/*
+The IBAN consists of up to 34 alphanumeric characters: first the
+two-letter ISO 3166-1 alpha-2 country code, then two check digits, and
+finally a country-specific Basic Bank Account Number (BBAN).[1] The
+check digits enable a sanity check of the bank account number to
+confirm its integrity before submitting a transaction. The BBAN format
+is decided by each national banking community: it must be of a fixed
+length of case-insensitive alphanumeric characters. It includes the
+domestic bank account number, branch identifier, and potential routing
+information.
+*/
+
+-- Note: requires a corresponding UDF first.
+create domain IBAN as varchar check (length(value) <= 34 and validate_iban(value));

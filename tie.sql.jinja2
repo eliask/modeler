@@ -1,0 +1,131 @@
+{% import 'util.jinja2' as util %}
+-- TIE
+
+{%- macro insert() %}
+  INSERT INTO "{{table}}" (metadata {% for fk in tie.fks %}, "{{fk.name}}"{% endfor %})
+  VALUES (NEW.metadata {% for fk in tie.fks %},NEW."{{fk.name}}"{% endfor %});
+{%- endmacro %}
+
+{%- macro default_metadata() %}
+-- For now, allow empty metadata:
+IF NEW.metadata IS NULL THEN
+  NEW.metadata := 0;
+END IF;
+{%- endmacro %}
+
+{%- macro default_valid_time() %}
+  IF NEW.valid_time IS NULL THEN
+    NEW.valid_time := {{tie.valid_type}}({{v_current_time}}, 'infinity', '[)');
+  END IF;
+{%- endmacro %}
+
+{%- macro insert_expression() %}
+  INSERT INTO "{{table}}" (
+    metadata
+    ,valid_time
+    {%- for fk in tie.fks %}
+    ,"{{fk.name}}"
+    {%- endfor %}
+  )
+  VALUES (
+    NEW.metadata
+    ,NEW.valid_time
+    {%- for fk in tie.fks %}
+    ,NEW."{{fk.name}}"
+    {%- endfor %}
+  );
+{%- endmacro %}
+
+
+create table if not exists "{{table}}" (
+  metadata integer not null
+{%- for fk in tie.fks %}
+  ,"{{fk.name}}" {{typeof_fk(fk)}} not null references "{{fk.table}}"("{{fk.ref_id}}")
+{%- endfor %}
+  ,EXCLUDE USING gist (
+{%- for fk in tie.fks %}
+    "{{fk.name}}" with =,
+{%- endfor %}
+    transaction_time with &&,
+    valid_time with &&
+  )
+) INHERITS (transaction_valid_{{tie.valid_type}});
+
+create or replace view "l_{{table}}"
+as select
+  metadata
+  ,"{{table}}".valid_time
+{%- for fk in tie.fks %}
+  ,"{{fk.name}}"
+{%- endfor %}
+from "{{table}}"
+where {{v_current_time}} <@ "{{table}}".valid_time
+  and {{t_current_time}} <@ "{{table}}".transaction_time
+;
+
+-- Tie triggers:
+CREATE OR REPLACE FUNCTION "delete_l_{{table}}"()
+RETURNS TRIGGER AS $$
+DECLARE
+  _count int;
+BEGIN
+  UPDATE "{{table}}" t
+  SET transaction_time = tstzrange(lower(transaction_time), current_timestamp, '[)')
+  WHERE current_timestamp <@ transaction_time
+  {%- for fk in tie.fks %}
+  AND "{{fk.name}}" = OLD."{{fk.name}}"
+  {%- endfor %}
+  ;
+
+  -- For compatibility with non-temporal-DB aware software (e.g. SQLAlchemy/Flask-Admin):
+  GET DIAGNOSTICS _count = ROW_COUNT;
+  create temporary table if not exists tmp (
+    a int not null
+  ) on commit drop;
+  insert into tmp select generate_series(1, _count);
+  delete from tmp;
+
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION "update_l_{{table}}"()
+RETURNS TRIGGER AS $$
+BEGIN
+
+  {{default_metadata()}}
+  {{default_valid_time()}}
+
+  IF NEW.* IS DISTINCT FROM OLD.* THEN
+    -- First invalidate the old version of the tie:
+    UPDATE "{{table}}"
+    SET transaction_time = tstzrange(lower(transaction_time), current_timestamp, '[)')
+    WHERE current_timestamp <@ transaction_time
+    AND valid_time = OLD.valid_time
+    {%- for fk in tie.fks %}
+    AND "{{fk.name}}" = OLD."{{fk.name}}"
+    {%- endfor %}
+    ;
+
+    -- Then insert a new validity time period for the tie:
+    {{insert_expression()}}
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION "insert_l_{{table}}"()
+RETURNS TRIGGER AS $$
+BEGIN
+
+  {{default_metadata()}}
+  {{default_valid_time()}}
+  {{insert_expression()}}
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+{{util.create_trigger_references(table, 'l_')}}

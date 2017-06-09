@@ -1,0 +1,79 @@
+#+TITLE: modeler - Relational DB modelling (or something)
+#+OPTIONS: ^:nil
+
+modeler is a modelling tool for relational databases (currently just PostgreSQL).
+
+- Terminology
+  + Logical table: like a "usual" (~3NF) table but abstracted to a view +
+    6NF attribute tables.
+
+- In some ways similar to Anchor Modelling but takes a different direction
+  + Built for PostgreSQL
+  + Adapts some naming conventions but does not enforce them
+  + Sensible plain-text configuration which scales
+  + Possible-to-understand bitemporality support with time ranges
+    (easy to express deletions too in a temporal manner)
+
+- Lightweight YAML based configuration format
+  + Easy to version control
+  + No boilerplate
+  + The right level of abstraction for certain data modelling cases
+  + Can still fallback to SQL and use PostgreSQL's features to the
+    fullest extent when necessary/convenient
+  + "Enum master data management" built in
+
+- Mostly 6NF
+  + No NULLs
+  + Easy temporality
+  + Audit metadata at "logical table" column level granularity without separate
+    audit tables
+  + Surrogate keys by default mostly
+  + etc.
+
+- Temporal 3NF/5NF style "business views"
+  + Create views composed of many OUTER JOINs (can include NULLs) to make life
+    easier/tolerable for external integrations
+  + Easy way to view "logical table" contents at any point-in-time in the past,
+    present, or the future.
+
+- Supports bitemporal (business time + transaction time)
+  + Business time: When something becomes valid from the business rule
+    perspective, e.g. when is this piece of data valid.
+    This could be retroactively set in the past, or pre-emptively in
+    the future, or anything in between.
+  + Transaction time: When was this piece of data valid in database time?
+    Transaction time is the time when the data was inserted into the
+    DB. If the data was altered or deleted, the transaction time
+    range's "end time" is the time at which the piece of information
+    was no longer up to date.
+    Transaction time is always meant to correspond to the actual time
+    when the the database transaction happens, in contrast with
+    business time.
+
+- Supports localized data
+  + Can specify that a piece of data is in multiple languages
+  + A logical table can contain localized (name/description) and un-localized
+    attributes (dates, bools, etc.)
+
+- Flexible metadata system, allowing for sensible Git-like reverts of
+  transactions.
+
+  + Each metadata-enabled logical table can be tagged in bulk or
+    individual transactions with changeset id + custom stuff like
+    application name, user id, data agent name/version, etc. etc.
+
+  + Changesets can be reverted by undoing the operations associated
+    with them. A revert is also a changeset, like in Git.
+
+  + Metadata is itself in 6NF form, or maybe JSONB, in one metadata (logical) table.
+
+- Sensible enums
+  + Enums are best implemented with fixed-size keys since otherwise it's
+    difficult to change even the enum code names.
+  + Enums can be optionally localized and/or codenamed
+  + Referential integrity for enums
+
+- PostgreSQL
+  + Uses extension btree_gist for temporal integrity constraints
+  + Also makes use of domains, table inheritance, etc.
+
